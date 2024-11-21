@@ -3,10 +3,17 @@ import sqlite3
 from flask import Flask, render_template, request, Response, redirect, url_for, flash, session, send_from_directory, abort, send_file
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
+from flask_limiter import Limiter				#Required to resolve Brute Force vulnerability 
+from flask_limiter.util import get_remote_address		#Required to resolve Brute Force vulnerability 
+from flask_wtf.csrf import CSRFProtect #Required to enable CSRF protection	#Required to resolve lack of CSRF Tokens 
+from urllib.parse import urlparse, urljoin		#Required to resolve Open Redirect vulnerability 
+from werkzeug.utils import escape  # Import escape function
 
 
 app = Flask(__name__)
 app.secret_key = 'trump123'  # Set a secure secret key
+
+csrf = CSRFProtect(app)  #Required to resolve lack of CSRF Tokens 	
 
 # Configure the SQLite database
 db_path = os.path.join(os.path.dirname(__file__), 'trump.db')
@@ -50,14 +57,22 @@ def sitemap():
     
 @app.route('/admin_panel')
 def admin_panel():
-    return render_template('admin_panel.html')
+    if ('user_id' in session) and (session['user_id'] == 1):
+            return render_template('admin_panel.html')
+    else:
+        return "Invalid destination", 400
+
+def is_safe_url(target):	#New function required to resolve Open Redirect Vulnerability 
+    ref_url = urlparse(request.host_url)  # Base URL of the application
+    test_url = urlparse(urljoin(request.host_url, target))  # Resolve the target URL
+    return test_url.scheme in ('http', 'https') and ref_url.netloc == test_url.netloc
 
 # Route to handle redirects based on the destination query parameter
 @app.route('/redirect', methods=['GET'])
 def redirect_handler():
     destination = request.args.get('destination')
 
-    if destination:
+    if destination and is_safe_url(destination): 	#Updated to check redirect URL is from the same domain
         return redirect(destination)
     else:
         return "Invalid destination", 400
@@ -66,8 +81,8 @@ def redirect_handler():
 @app.route('/comments', methods=['GET', 'POST'])
 def comments():
     if request.method == 'POST':
-        username = request.form['username']
-        comment_text = request.form['comment']
+        username = escape(request.form['username'])
+        comment_text = escape(request.form['comment'])
 
         # Insert comment into the database
         insert_comment_query = text("INSERT INTO comments (username, text) VALUES (:username, :text)")
@@ -92,8 +107,8 @@ def download():
     file_path = os.path.abspath(os.path.join(base_directory, file_name))
 
     # Ensure that the file path is within the base directory
-    #if not file_path.startswith(base_directory):
-     #   return "Unauthorized access attempt!", 403
+    if not file_path.startswith(base_directory):		#Uncommented line to resolve Path Traversal
+        return "Unauthorized access attempt!", 403		#Uncommented line to resolve Path Traversal
 
     # Try to open the file securely
     try:
@@ -113,37 +128,44 @@ def download_page():
 
 @app.route('/profile/<int:user_id>', methods=['GET'])
 def profile(user_id):
-    query_user = text(f"SELECT * FROM users WHERE id = {user_id}")
-    user = db.session.execute(query_user).fetchone()
-
-    if user:
-        query_cards = text(f"SELECT * FROM carddetail WHERE id = {user_id}")
-        cards = db.session.execute(query_cards).fetchall()
-        return render_template('profile.html', user=user, cards=cards)
-    else:
-        return "User not found or unauthorized access.", 403
+    if 'user_id' in session:
+        query_user = text(f"SELECT * FROM users WHERE id = {user_id}")
+        user = db.session.execute(query_user).fetchone()
+        
+        if user and (session['user_id'] == user.id):
+            query_cards = text(f"SELECT * FROM carddetail WHERE id = {user_id}")
+            cards = db.session.execute(query_cards).fetchall()
+            return render_template('profile.html', user=user, cards=cards)
+        else:
+            return "User not found or unauthorized access.", 403
+    return render_template('login.html')
+    
 from flask import request
 
 @app.route('/search', methods=['GET'])
 def search():
-    query = request.args.get('query')
+    #query = request.args.get('query')   Vulnerable query
+    query = escape(request.args.get('query'))
     return render_template('search.html', query=query)
 
 @app.route('/forum')
 def forum():
     return render_template('forum.html')
 
+limiter = Limiter(get_remote_address, app=app) 		#Required to resolve Brute Force vulnerability 
+
 # Add login route
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")  # Allow only 5 attempts per minute 	#Required to resolve Brute Force vulnerability 
 def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
 
-        query = text(f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'")
-        user = db.session.execute(query).fetchone()
+        query = text(f"SELECT * FROM users WHERE username = :username")
+        user = db.session.execute(query, {'username': username}).fetchone()        
 
-        if user:
+        if user and (pwd_context.verify(password, user.password)): # Compares the hashed password value with the user password entered
             session['user_id'] = user.id
             flash('Login successful!', 'success')
             return redirect(url_for('profile', user_id=user.id))
@@ -166,9 +188,34 @@ def logout():
     
 from flask import session
 
+# hash plain text passwords route
+from passlib.context import CryptContext
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Function to hash the password
+def hash_password(plain_password: str) -> str:
+    return pwd_context.hash(plain_password)
+
+@app.route('/hasher')
+def hasher():
+    query = text(f"SELECT * FROM users")
+    users = db.session.execute(query).fetchall()
+    for user in users:
+        print(user.id," - ", user.username," - ", user.password, "\n")
+    
+    for user in users:
+        # Hash the plain text password
+        hashed_password = hash_password(user.password)
+
+        # Update the password field with the hashed password
+        update_password_query = text("UPDATE users SET password = :pwd WHERE id = :id")
+        db.session.execute(update_password_query, {'id': user.id, 'pwd': hashed_password})
+        print(hashed_password,"\n")
+    
+    db.session.commit()     
+    return redirect(url_for('index'))
 if __name__ == '__main__':
     initialize_database()  # Initialize the database on application startup if it doesn't exist
     with app.app_context():
         db.create_all()  # Create tables based on models if they don't already exist
-    app.run(debug=True)
+    app.run(debug=False)	#Required to resolve console debugger leaking sensitive information.
